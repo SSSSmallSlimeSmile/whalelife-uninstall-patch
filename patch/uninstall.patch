@@ -1,0 +1,166 @@
+diff --git a/core/runtime.ts b/core/runtime.ts
+index 46edb8e..7eb8ea3 100644
+--- a/core/runtime.ts
++++ b/core/runtime.ts
+@@ -4,8 +4,8 @@
+  */
+ import { Context as Cordis } from "@cordisjs/core";
+ import { readFileSync } from "node:fs";
+-import { readdir, readFile, mkdir, stat } from "node:fs/promises";
+-import { join, basename, resolve } from "node:path";
++import { readdir, readFile, mkdir, stat, rm, rename } from "node:fs/promises";
++import { join, basename, resolve, relative } from "node:path";
+ import { pathToFileURL } from "node:url";
+ import { parse } from "yaml";
+ import { atomic } from "./memory.ts";
+@@ -586,7 +586,33 @@ export class Runtime {
+     })();
+     return record.stopping;
+   }
+-  async action(id: string, action: string) {
++  /** 删除一个直接放在 plugins/ 下的插件目录。只在 action() 的 serial 里调用。 */
++  private async uninstallNow(record: any, deleteData: boolean) {
++    const id: string = record.id;
++    if (record.parent) throw Error("子插件请删父插件的 sub 目录");
++    const dir: string = record.dir || "";
++    const rel = dir ? relative(join(this.root, "plugins"), dir) : "";
++    if (!dir || !rel || rel.startsWith("..") || rel.includes(":")) throw Error("插件目录不在 plugins 下，已拒绝");
++    if (!(await stat(join(dir, "plugin.yaml")).catch(() => null))?.isFile()) throw Error("目录里没有 plugin.yaml，已拒绝");
++    await this.pluginState.setEnabled(id, false);
++    await this.stop(id);
++    this.records.delete(id);
++    const data = await this.preserveData(id, dir, deleteData);
++    await removeTree(dir);
++    this.logger.info("插件已卸载", { id, dir, data });
++    return { id, dir, data };
++  }
++  /** 删程序文件前把 data/ 挪走；deleteData 为真时随目录一起删。 */
++  private async preserveData(id: string, dir: string, drop: boolean) {
++    const data = join(dir, "data");
++    if (!(await stat(data).catch(() => null))?.isDirectory()) return null;
++    if (drop) return null;
++    const target = join(this.root, ".artifacts", "uninstalled-plugin-data", id.split("/").join("_") + "-" + Date.now());
++    await mkdir(join(target, ".."), { recursive: true });
++    await rename(data, target);
++    return target;
++  }
++  async action(id: string, action: string, opts: { deleteData?: boolean } = {}) {
+     this.packageSignal.throwIfAborted();
+     return this.serial(async () => {
+       if (this.closing) throw Error("核心正在关闭");
+@@ -594,8 +620,9 @@ export class Runtime {
+       const record = this.records.get(id);
+       if (!record) throw Error("插件不存在");
+       if (record?.manifest.builtin) throw Error("内置插件不可管理");
+-      if (!["stop", "start", "reload"].includes(action)) throw Error("操作无效");
++      if (!["stop", "start", "reload", "uninstall"].includes(action)) throw Error("操作无效");
+       await this.pluginState.load();
++      if (action === "uninstall") return this.uninstallNow(record, opts.deleteData === true);
+       if (action === "stop") {
+         await this.pluginState.setEnabled(id, false);
+         return this.stop(id);
+@@ -612,3 +639,16 @@ export class Runtime {
+     });
+   }
+ }
++
++/** Windows 上进程刚退出时目录可能还被占着，重试几次。 */
++async function removeTree(dir: string) {
++  for (let i = 0; i < 8; i++) {
++    try {
++      await rm(dir, { recursive: true, force: true });
++      return;
++    } catch (error: any) {
++      if (i === 7) throw error;
++      await new Promise((r) => setTimeout(r, 150 * (i + 1)));
++    }
++  }
++}
+diff --git a/core/ui/extensions.js b/core/ui/extensions.js
+index 52e8fe5..2669f2e 100644
+--- a/core/ui/extensions.js
++++ b/core/ui/extensions.js
+@@ -71,18 +71,41 @@ export function updateExtensionContent(content, markup) {
+ function actions(p) {
+   return `<button class="btn small" data-plugin-id="${e(p.id)}" data-plugin-action="${(p.enabled ?? p.status === "active") ? "stop" : "start"}">${(p.enabled ?? p.status === "active") ? "停用" : "启用"}</button><button class="btn small tonal" data-plugin-id="${e(p.id)}" data-plugin-action="reload">${icon("refresh")}重载</button>`;
+ }
+-export function pluginCard(status, p, state) {
++export function managedRecord(state, id) {
++   return Boolean(state?.officialPlugins?.some(item => item.installed && item.runtimeId === id)
++     || state?.communityManaged?.some(item => item.id === id));
++ }
++ function uninstallButton(id) {
++   return `<button type="button" class="btn small official-remove" data-plugin-uninstall="${e(id)}" title="删除 plugins 下的插件目录（先停用；data 会保留到 .artifacts）">删除</button>`;
++ }
++ function removable(state, p) {
++   return !p.id.includes("/") && !p.builtin && !managedRecord(state, p.id);
++ }
++ export function pluginCard(status, p, state) {
+   const grouped = pluginGroup(status, p.id)?.id === p.id;
+   const children = plugins(status).filter(c => c.id !== p.id && belongs(c.id, p.id));
+   const childMenu = grouped && children.length ? `<details class="plugin-card-children"><summary>${children.length} 个子插件 ${renderChildUpdates(state, p.id)}</summary>
+     ${children.map(child => `<div class="plugin-card-child"><span class="store-name-line">${manageIcon(state, child, true)}<a href="#${pluginKey(child.id)}">${e(child.name || child.id)}</a>${renderManageBadgeSlot(state, child.id)}</span>${renderManageSlot(state, child.id)}</div>`).join("")}</details>` : "";
+-  return `<article class="panel plugin-card ${p.id.includes("/") ? "child" : ""}"><div class="row">${manageIcon(state, p)}<div class="store-name-line"><h3>${e(p.name || p.id)}</h3>${renderManageBadgeSlot(state, p.id)}</div><div class="spacer"></div>${badge(p)}</div><code>${e(p.id)} · v${e(p.version || "0.1.0")}</code><p class="${p.error ? "plugin-error" : ""}">${e(p.error || p.description || "扩展插件")}</p><footer>${grouped ? `<a class="btn small" href="#${pluginKey(p.id)}">${icon("sliders")}打开 / 管理</a>` : extensionSettings(status, p.id)}${actions(p)}${renderManageSlot(state, p.id)}${!grouped && p.id.includes("/") ? '<small class="plugin-child-count">子插件</small>' : ""}</footer>${childMenu}</article>`;
++  return `<article class="panel plugin-card ${p.id.includes("/") ? "child" : ""}"><div class="row">${manageIcon(state, p)}<div class="store-name-line"><h3>${e(p.name || p.id)}</h3>${renderManageBadgeSlot(state, p.id)}</div><div class="spacer"></div>${badge(p)}</div><code>${e(p.id)} · v${e(p.version || "0.1.0")}</code><p class="${p.error ? "plugin-error" : ""}">${e(p.error || p.description || "扩展插件")}</p><footer>${grouped ? `<a class="btn small" href="#${pluginKey(p.id)}">${icon("sliders")}打开 / 管理</a>` : extensionSettings(status, p.id)}${actions(p)}${renderManageSlot(state, p.id)}${removable(state, p) ? uninstallButton(p.id) : ""}${!grouped && p.id.includes("/") ? '<small class="plugin-child-count">子插件</small>' : ""}</footer>${childMenu}</article>`;
+ }
+ export function bindPluginActions(app) {
+   if (app.state) bindManageActions(app);
+   app.content.querySelectorAll(".plugin-more").forEach(menu => menu.addEventListener?.("keydown", event => {
+     if (event.key === "Escape") { menu.open = false; menu.querySelector("summary").focus(); }
+   }));
++  app.content.querySelectorAll("[data-plugin-uninstall]").forEach(button => {
++    button.onclick = async () => {
++      const id = button.dataset.pluginUninstall;
++      const ok = confirm("删除插件 " + id + "？\n\n会先停用，再删掉 plugins 下的整个目录。\n它的 data/ 会移到 .artifacts/uninstalled-plugin-data/ 保留。\n\n这一步不可撤销。");
++      if (!ok) return;
++      button.disabled = true;
++      try {
++        await api("/api/plugin", { id, action: "uninstall" });
++        await app.refreshStatus(); app.render(); app.toast("插件已删除");
++      } catch (error) { app.toast(error.message, true); }
++      finally { button.disabled = false; }
++    };
++  });
+   app.content.querySelectorAll("[data-plugin-action]").forEach(button => {
+     button.onclick = async () => {
+       button.disabled = true;
+@@ -96,11 +119,14 @@ export function bindPluginActions(app) {
+ }
+ function familyNavigation(status, root, selected) {
+   const members = plugins(status).filter(p => belongs(p.id, root.id));
++  // 没有子插件时不画这行：父 tab 只会指向自己，跟上面的标题重复。
++  const children = members.filter(p => p.id !== root.id);
++  // 父 tab 不再画：只指向自己那页，和上面的标题重复。只有子插件才需要这一行。
++  if (!children.length) return "";
+   const label = p => members.filter(parent => parent.id !== root.id && belongs(p.id, parent.id))
+     .sort((a, b) => a.id.length - b.id.length).map(parent => parent.name || parent.id).join(" / ");
+-  const link = (p, parent = false) => `<a class="plugin-family-link ${p.id === selected.id ? "selected" : ""}" href="#${pluginKey(p.id)}" title="${e(parent ? `${p.name || p.id} · 父插件设置` : `${label(p)} · ${statusName(p.status)}`)}" ${p.id === selected.id ? 'aria-current="page"' : ""}><span class="plugin-state-dot ${p.status === "active" ? "running" : p.status === "failed" ? "failed" : ""}" aria-label="${e(statusName(p.status))}"></span><span>${e(parent ? `${p.name || p.id} 设置` : label(p))}</span></a>`;
+-  const children = members.filter(p => p.id !== root.id);
+-  return `<nav class="plugin-family" aria-label="父子插件"><div class="plugin-parent-tab">${link(root, true)}</div>${children.length ? `<span class="plugin-family-label">子插件</span><div class="plugin-child-tabs">${children.map(p => link(p)).join("")}</div>` : ""}</nav>`;
++  const link = (p, parent = false) => `<a class="plugin-family-link ${p.id === selected.id ? "selected" : ""}" href="#${pluginKey(p.id)}" title="${e(parent ? `${p.name || p.id} · 设置` : `${label(p)} · ${statusName(p.status)}`)}" ${p.id === selected.id ? 'aria-current="page"' : ""}><span class="plugin-state-dot ${p.status === "active" ? "running" : p.status === "failed" ? "failed" : ""}" aria-label="${e(statusName(p.status))}"></span><span>${e(parent ? `${p.name || p.id} 设置` : label(p))}</span></a>`;
++  return `<nav class="plugin-family" aria-label="父子插件"><span class="plugin-family-label">子插件</span><div class="plugin-child-tabs">${children.map(p => link(p)).join("")}</div></nav>`;
+ }
+ function groupPage(app, owner, entry, root) {
+   const status = app.state.status;
+@@ -109,7 +135,7 @@ function groupPage(app, owner, entry, root) {
+   const content = entry ? `<section class="panel extension-panel"><iframe class="extension-frame" title="${e(entry.title)}" src="${e(entry.path)}"></iframe></section>`
+     : `<div class="plugin-empty">${icon("puzzle")}<h2>${owner.status === "active" ? "暂无可用页面" : "插件未运行"}</h2><p>${owner.status === "active" ? "此插件未注册可用页面，或原页面已移除。" : "可以在右上方启用或重载，已有设置会保留。"}</p></div>`;
+   const info = `<details class="plugin-more"><summary class="btn small" aria-label="插件信息与更多操作" title="插件信息与更多操作">${icon("more")}</summary><div class="plugin-more-menu"><strong>${e(owner.name || owner.id)}</strong><code>${e(owner.id)} · v${e(owner.version || "0.1.0")}</code><p>${e(owner.description || "扩展插件")}</p><button class="btn small" data-plugin-id="${e(owner.id)}" data-plugin-action="reload">${icon("refresh")}重载插件</button></div></details>`;
+-  const heading = `<header class="plugin-detail"><div class="plugin-location"><a href="#plugins" aria-label="返回插件管理" title="返回插件管理">${icon("back")}</a><a class="plugin-root-name" href="#${pluginKey(root.id)}">${e(root.name || root.id)}</a>${owner.id !== root.id ? `${icon("chevron")}<span class="plugin-selected-name">${e(owner.name || owner.id)}</span>` : '<span class="plugin-location-kind">父插件</span>'}</div><div class="plugin-controls">${badge(owner)}<button class="btn small ${(owner.enabled ?? owner.status === "active") ? "" : "primary"}" data-plugin-id="${e(owner.id)}" data-plugin-action="${(owner.enabled ?? owner.status === "active") ? "stop" : "start"}">${(owner.enabled ?? owner.status === "active") ? "停用" : "启用"}</button>${renderManageSlot(app.state, owner.id)}${info}</div></header>`;
++  const heading = `<header class="plugin-detail"><div class="plugin-location"><a href="#plugins" aria-label="返回插件管理" title="返回插件管理">${icon("back")}</a><a class="plugin-root-name" href="#${pluginKey(root.id)}">${e(root.name || root.id)}</a>${owner.id !== root.id ? `${icon("chevron")}<span class="plugin-selected-name">${e(owner.name || owner.id)}</span>` : ''}</div><div class="plugin-controls">${badge(owner)}<button class="btn small ${(owner.enabled ?? owner.status === "active") ? "" : "primary"}" data-plugin-id="${e(owner.id)}" data-plugin-action="${(owner.enabled ?? owner.status === "active") ? "stop" : "start"}">${(owner.enabled ?? owner.status === "active") ? "停用" : "启用"}</button>${renderManageSlot(app.state, owner.id)}${removable(app.state, owner) ? uninstallButton(owner.id) : ""}${info}</div></header>`;
+   const notice = owner.error ? `<div class="plugin-notice" role="status">${icon("info")}<span>${e(owner.error)}</span></div>` : "";
+   return `<div class="plugin-workspace" data-runtime-id="${e(owner.id)}">${heading}${familyNavigation(status, root, owner)}<div data-official-read-status role="status"></div><div class="plugin-workspace-main">${notice}${pageLinks}${content}</div></div>`;
+ }
+diff --git a/core/web.ts b/core/web.ts
+index 6a6e28e..e6c3c8a 100644
+--- a/core/web.ts
++++ b/core/web.ts
+@@ -739,7 +739,7 @@ export async function startWeb(config: any, services: any, runtime: any) {
+         return send(200, logger.lines);
+       if (req.method === "POST" && req.url === "/api/plugin") {
+         const data = await body(req);
+-        await runtime.action(data.id, data.action);
++        await runtime.action(data.id, data.action, { deleteData: data.deleteData === true });
+         return send(200, { ok: true });
+       }
+       if (await routes.serve(req.method!, memoryUrl.pathname, req, res)) return;
